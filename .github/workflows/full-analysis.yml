@@ -1,0 +1,104 @@
+name: Full Latin extraction and Bayesian analysis
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract-and-analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out analysis repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Obtain complete Pedecerto XML mirror
+        run: |
+          mkdir -p external
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/tesserae/tesserae-v6.git external/tesserae
+          git -C external/tesserae sparse-checkout set data/pedecerto
+          test -d external/tesserae/data/pedecerto
+          find external/tesserae/data/pedecerto -name '*.xml' | wc -l
+
+      - name: Obtain all current Latin UD treebanks
+        run: |
+          mkdir -p external/ud
+          for repo in Perseus PROIEL ITTB LLCT UDante CIRCSE; do
+            git clone --depth 1 "https://github.com/UniversalDependencies/UD_Latin-${repo}.git" "external/ud/UD_Latin-${repo}" || true
+          done
+          find external/ud -name '*.conllu' | wc -l
+
+      - name: Download precomputed LatinPipe syntax database
+        id: syntax
+        continue-on-error: true
+        run: |
+          mkdir -p external/syntax
+          curl -fL --retry 5 --retry-all-errors \
+            -o external/syntax_latin.db.tar.gz \
+            https://tesserae.caset.buffalo.edu/tesserae-data/syntax_latin.db.tar.gz
+          echo 'eb5d29a760137eeaa6dcc160a35cc38956976ff82a3808ff1a2dd3f818660477  external/syntax_latin.db.tar.gz' | sha256sum -c -
+          tar -xzf external/syntax_latin.db.tar.gz -C external/syntax
+          DB_PATH=$(find external/syntax -type f -name 'syntax_latin.db' | head -n 1)
+          test -n "$DB_PATH"
+          cp "$DB_PATH" external/syntax_latin.db
+          sqlite3 external/syntax_latin.db 'SELECT COUNT(*) AS texts FROM texts; SELECT COUNT(*) AS lines FROM syntax;'
+
+      - name: Run extraction and Bayesian models
+        env:
+          PYTHONUNBUFFERED: '1'
+          OMP_NUM_THREADS: '2'
+          OPENBLAS_NUM_THREADS: '2'
+          MKL_NUM_THREADS: '2'
+        run: |
+          mkdir -p outputs
+          if test -f external/syntax_latin.db; then
+            python analysis/run_all.py \
+              --pedecerto external/tesserae/data/pedecerto \
+              --syntax-db external/syntax_latin.db \
+              --ud-root external/ud \
+              --out outputs
+          else
+            python analysis/run_all.py \
+              --pedecerto external/tesserae/data/pedecerto \
+              --ud-root external/ud \
+              --out outputs
+          fi
+
+      - name: Record environment and source revisions
+        if: always()
+        run: |
+          mkdir -p outputs
+          python --version > outputs/environment.txt
+          pip freeze >> outputs/environment.txt
+          git -C external/tesserae rev-parse HEAD > outputs/tesserae_commit.txt || true
+          for d in external/ud/UD_Latin-*; do
+            test -d "$d/.git" || continue
+            printf '%s\t%s\n' "$(basename "$d")" "$(git -C "$d" rev-parse HEAD)"
+          done > outputs/ud_commits.tsv
+          find outputs -maxdepth 2 -type f -printf '%p\t%s bytes\n' | sort > outputs/artifact_manifest.tsv
+
+      - name: Upload complete result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latin-poetic-word-order-results
+          path: outputs/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6
